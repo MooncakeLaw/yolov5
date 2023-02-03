@@ -1,107 +1,100 @@
-from openvino.runtime import Core
-import cv2
 import numpy as np
+import cv2, torch
+from openvino.runtime import Core
+from utils.general import non_max_suppression
+from utils.augmentations import letterbox  
 
-# 请手动配置推理计算设备，IR文件路径，图片路径，阈值和标签
-DEVICE = "CPU"
-ONNX_FileXML = r"C:\Users\NUC\yolov5\yolov5s.onnx"
-IMAGE_FILE = r"C:\Users\NUC\yolov5\2.jpeg"
-CONF_THRESHOLD = 0.5  #取值0~1
-#标签输入
-with open(r'C:\Users\NUC\yolov5\coco-labels-2014_2017.txt', 'r') as f:
-    LABELS = [x.strip() for x in f]
-# YOLOv5s输入尺寸
-INPUT_WIDTH = 640
-INPUT_HEIGHT = 640
-# 调色板
-colors = [(255, 255, 0), (0, 255, 0), (0, 255, 255), (255, 0, 0)]
+# Load COCO Label from yolov5/data/coco.yaml
+with open(r'C:\Users\NUC\yolov5\coco-labels-2014_2017.txt','r', encoding='utf-8') as f:
+    class_list = [x.strip() for x in f]
 
-# --------------------------- 1. 创建Core对象 --------------------------------------
-print("1.Create Core Object.")
-ie = Core()
 
-# --------------------------- 2. 载入模型到AI推理计算设备----------------------------
-print("2.Load model into device...")
-exec_net = ie.compile_model(model=ONNX_FileXML, device_name=DEVICE)
+# color palette
+colors = [(200, 150, 0), (0, 200, 0), (0, 200, 150), (200, 0, 0)]
 
-# --------------------------- 3. 准备输入数据 --------------------------------------
-# 由OpenCV完成数据预处理：RB交换、Resize，归一化和HWC->NCHW
-print("3.Prepare the input data for the model...")
-frame = cv2.imread(IMAGE_FILE)
-if frame is None:
-    raise Exception("Can not read image file: {} by cv2.imread".format(IMAGE_FILE))
-# 按照YOLOv5要求，先将图像长:宽 = 1:1，多余部分填充黑边,将图像按最大边1:1放缩
-row, col, _ = frame.shape
-_max = max(col, row)
-im = np.zeros((_max, _max, 3), np.uint8)
-im[0:row, 0:col] = frame
-blob = cv2.dnn.blobFromImage(im, 1 / 255.0, (INPUT_WIDTH, INPUT_HEIGHT), swapRB=True, crop=False)
+def sigmoid(x):
+    return 1.0/(1+np.exp(-x))
+# Rescale coords (xyxy) from according to r and (dh, dw) from letterbox
+def rescale_coords(ratio, pad, coords):
+    # Rescale coords (xyxy) from according to r and (dh, dw) from letterbox
+    coords[:, [1, 3]] -= pad[0]  # H padding
+    coords[:, [0, 2]] -= pad[1]  # W padding
+    coords[:, :4] /= ratio
+    return coords
 
-# --------------------------- 4. 执行推理并获得结果 ------------------------------------
-print("4.Start Inference......")
-import time
-start = time.time()
-result = exec_net.create_infer_request().infer({"images":blob})
-for object,value in result.items():
-    if object.names == {'output'}:
-        outputs = value
-end = time.time()
+# Step1: Create OpenVINO Runtime Core
+core = Core()
+# Step2: Compile the Model, using dGPU A770m
+net = core.compile_model("yolov5s-seg.onnx", "AUTO")
+output0, output1 = net.outputs[0],net.outputs[1]
+b,n,input_h,input_w = net.inputs[0].shape
 
-# --------------------------- 5. 处理推理计算结果 --------------------------------------
-print("5.Postprocess the inference result......")
-# yolov5导出模型输出为：
-# output层形状为[1,N,85], 其中N为预测框的个数，85为[cx, cy, w, h, score, 80个类的得分]
-# 找出output层 且 score >= CONF_THRESHOLD的结果
-class_ids = []
-confidences = []
-boxes = []
-output_data = outputs[0]
-print(output_data)
-rows = output_data.shape[0]
+# Step3: Preprocess the image before inference
+frame =cv2.imread("1.jpeg")
+fh, fw, fc = frame.shape
+im, r, (dw, dh)= letterbox(frame, new_shape=(input_h,input_w), auto=False) # Resize to new shape by letterbox
+blob = im.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+blob = np.ascontiguousarray(blob)  # contiguous
+blob = np.float32(blob) / 255.0    # 0 - 255 to 0.0 - 1.0
+blob = blob[None]  # expand for batch dim
 
-image_width, image_height, _ = im.shape
-x_factor = image_width / INPUT_WIDTH
-y_factor = image_height / INPUT_HEIGHT
+# Step4: Do the inference
+outputs = net([blob])
+pred, proto = outputs[output0], outputs[output1]
 
-for r in range(rows):
-    row = output_data[r]
-    confidence = row[4]
-    if confidence >= 0.4:
-        classes_scores = row[5:]
-        _, _, _, max_indx = cv2.minMaxLoc(classes_scores)
-        class_id = max_indx[1]
-        if (classes_scores[class_id] > .25):
-            confidences.append(float(confidence))
-            class_ids.append(class_id)
-            x, y, w, h = row[0].item(), row[1].item(), row[2].item(), row[3].item()
-            left = int((x - 0.5 * w) * x_factor)
-            top = int((y - 0.5 * h) * y_factor)
-            width = int(w * x_factor)
-            height = int(h * y_factor)
-            box = np.array([left, top, width, height])
-            boxes.append(box)
+# Step5: Postprocess the inference result and visulize it.
+pred = torch.tensor(pred)
+pred = non_max_suppression(pred, nm=32)[0].numpy() #(n,38) tensor per image [xyxy, conf, cls, masks]
+# (n,38) tensor per image [xyxy, conf, cls, masks]
+bboxes, confs, class_ids, masks= pred[:,:4], pred[:,4], pred[:,5], pred[:,6:]
 
-indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.25, 0.45)
+# Extract the mask of the detected object
+proto = np.squeeze(proto)
+proto = np.reshape(proto, (32,-1))
+obj_masks = np.matmul(masks,proto)
+obj_masks = np.reshape(sigmoid(obj_masks), (-1, 160, 160))
 
-result_class_ids = []
-result_confidences = []
-result_boxes = []
+masks_roi = []
+for obj_mask, bbox in zip(obj_masks, bboxes):
+    mx1 = max(0, np.int32((bbox[0] * 0.25)))
+    my1 = max(0, np.int32((bbox[1] * 0.25)))
+    mx2 = max(0, np.int32((bbox[2] * 0.25)))
+    my2 = max(0, np.int32((bbox[3] * 0.25)))
+    masks_roi.append(obj_mask[my1:my2,mx1:mx2])
 
-for i in indexes:
-    result_class_ids.append(np.array(class_ids)[i])
-    result_boxes.append(np.array(boxes)[i])
-    result_confidences.append(np.array(confidences)[i])
+# rescale the coordinates
+bboxes = rescale_coords(r[0], (dh, dw), bboxes).astype(int)
 
-# 显示检测框bbox
-for (classid, confidence, box) in zip(result_class_ids, result_confidences, result_boxes): 
-    color = colors[int(classid) % len(colors)]
-    print(box)
-    print(color)
-    cv2.rectangle(frame, box, color, 2)
-    cv2.rectangle(frame, (box[0], box[1] - 20), (box[0] + box[2], box[1]), color, -1)
-    cv2.putText(frame, LABELS[classid], (box[0], box[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 0, 0))
+color_mask = np.zeros((fh, fw, 3), dtype=np.uint8)
+black_mask = np.zeros((fh, fw), dtype=np.float32)
+mv = cv2.split(color_mask)
+#Show bboxes and object's masks
+for bbox, conf, class_id, mask_roi in zip(bboxes, confs, class_ids, masks_roi):
+    x1,y1,x2,y2 = bbox[0], bbox[1], bbox[2], bbox[3]    
+    # Draw Mask
+    color = colors[int(class_id) % len(colors)]
+    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+    cv2.rectangle(frame, (x1, y1 - 20), (x2, y1), color, -1)
+    # Draw mask of the detected objects
+    result_mask = cv2.resize(mask_roi, (bbox[2]-bbox[0], bbox[3]-bbox[1]))
+    result_mask[result_mask > 0.5] = 1.0
+    result_mask[result_mask <= 0.5] = 0.0
+    rh, rw = result_mask.shape
+    rh, rw = result_mask.shape
+    if (y1+rh) >= fh:
+        rh = fh - y1
+    if (x1+rw) >= fw:
+        rw = fw - x1
+    black_mask[y1:y1+rh, x1:x1+rw] = result_mask[0:rh, 0:rw]
+    mv[2][black_mask == 1], mv[1][black_mask == 1], mv[0][black_mask == 1] = \
+            [np.random.randint(0, 256), np.random.randint(0, 256), np.random.randint(0, 256)]
+    # Draw Label
+    cv2.putText(frame, class_list[int(class_id)]+":"+ "%0.2f"%conf, (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255))
 
-cv2.imshow("Detection results", frame)
+# Add Masks to the frame
+color_mask = cv2.merge(mv)
+dst = cv2.addWeighted(frame, 0.5, color_mask, 0.5, 0)
+# Show the frame with the masks
+cv2.imshow("YOLOv5-Seg inference on Intel dGPU Demo", dst)
 cv2.waitKey()
 cv2.destroyAllWindows()
-print("All is completed!")
